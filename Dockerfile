@@ -1,19 +1,71 @@
-FROM debian
-RUN apt update
-RUN DEBIAN_FRONTEND=noninteractive apt install qemu-kvm *zenhei* xz-utils dbus-x11 curl firefox-esr gnome-system-monitor mate-system-monitor  git xfce4 xfce4-terminal tightvncserver wget   -y
-RUN wget https://github.com/novnc/noVNC/archive/refs/tags/v1.2.0.tar.gz
-RUN curl -LO https://proot.gitlab.io/proot/bin/proot
-RUN chmod 755 proot
-RUN mv proot /bin
-RUN tar -xvf v1.2.0.tar.gz
-RUN mkdir  $HOME/.vnc
-RUN echo 'luo' | vncpasswd -f > $HOME/.vnc/passwd
-RUN chmod 600 $HOME/.vnc/passwd
-RUN echo 'whoami ' >>/luo.sh
-RUN echo 'cd ' >>/luo.sh
-RUN echo "su -l -c  'vncserver :2000 -geometry 1280x800' "  >>/luo.sh
-RUN echo 'cd /noVNC-1.2.0' >>/luo.sh
-RUN echo './utils/launch.sh  --vnc localhost:7900 --listen 8900 ' >>/luo.sh
-RUN chmod 755 /luo.sh
-EXPOSE 8900
-CMD  /luo.sh
+ARG ARCH
+ARG IMAGE=ossrs/srs:ubuntu20
+FROM ${ARCH}${IMAGE} AS build
+
+ARG CONFARGS
+ARG MAKEARGS
+ARG INSTALLDEPENDS
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG SRS_AUTO_PACKAGER
+RUN echo "BUILDPLATFORM: $BUILDPLATFORM, TARGETPLATFORM: $TARGETPLATFORM, PACKAGER: ${#SRS_AUTO_PACKAGER}, CONFARGS: ${CONFARGS}, MAKEARGS: ${MAKEARGS}, INSTALLDEPENDS: ${INSTALLDEPENDS}"
+
+# https://serverfault.com/questions/949991/how-to-install-tzdata-on-a-ubuntu-docker-image
+ENV DEBIAN_FRONTEND noninteractive
+
+# To use if in RUN, see https://github.com/moby/moby/issues/7281#issuecomment-389440503
+# Note that only exists issue like "/bin/sh: 1: [[: not found" for Ubuntu20, no such problem in CentOS7.
+SHELL ["/bin/bash", "-c"]
+
+# Install depends tools.
+RUN if [[ $INSTALLDEPENDS != 'NO' ]]; then \
+        apt-get update && apt-get install -y gcc make g++ patch unzip perl git libasan5; \
+    fi
+
+# Copy source code to docker.
+COPY . /srs
+WORKDIR /srs/trunk
+
+# Build and install SRS.
+# Note that SRT is enabled by default, so we configure without --srt=on.
+# Note that we have copied all files by make install.
+RUN ./configure --gb28181=on --h265=on ${CONFARGS} && make ${MAKEARGS} && make install
+
+############################################################
+# dist
+############################################################
+FROM ${ARCH}ubuntu:focal AS dist
+
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+RUN echo "BUILDPLATFORM: $BUILDPLATFORM, TARGETPLATFORM: $TARGETPLATFORM"
+
+# Expose ports for streaming @see https://github.com/ossrs/srs#ports
+EXPOSE 1935 1985 8080 8000/udp 10080/udp
+
+# FFMPEG 4.1
+COPY --from=build /usr/local/bin/ffmpeg /usr/local/srs/objs/ffmpeg/bin/ffmpeg
+# SRS binary, config files and srs-console.
+COPY --from=build /usr/local/srs /usr/local/srs
+
+# Test the version of binaries.
+RUN ldd /usr/local/srs/objs/ffmpeg/bin/ffmpeg && \
+    /usr/local/srs/objs/ffmpeg/bin/ffmpeg -version && \
+    ldd /usr/local/srs/objs/srs && \
+    /usr/local/srs/objs/srs -v
+# Install noVNC
+RUN	wget https://github.com/novnc/websockify/archive/v${websockify_version}.tar.gz -O /websockify.tar.gz \
+	&& tar -xvf /websockify.tar.gz -C / \
+	&& cd /websockify-${websockify_version} \
+	&& python setup.py install \
+	&& cd / && rm -r /websockify.tar.gz /websockify-${websockify_version} \
+	&& wget https://github.com/novnc/noVNC/archive/v${noVNC_version}.tar.gz -O /noVNC.tar.gz \
+	&& tar -xvf /noVNC.tar.gz -C / \
+	&& cd /noVNC-${noVNC_version} \
+	&& ln -s vnc.html index.html \
+	&& rm /noVNC.tar.gz
+
+# Default workdir and command.
+WORKDIR /usr/local/srs
+ENV SRS_DAEMON=off
+CMD ["./objs/srs", "-c", "conf/srs.conf"]
